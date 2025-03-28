@@ -1,89 +1,162 @@
 package main;
 
-import org.bytedeco.ffmpeg.global.avcodec;
 import org.bytedeco.javacv.*;
 
+import javax.imageio.IIOImage;
+import javax.imageio.ImageIO;
+import javax.imageio.ImageWriteParam;
+import javax.imageio.ImageWriter;
+import javax.imageio.stream.MemoryCacheImageOutputStream;
+import java.awt.image.BufferedImage;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.ShortBuffer;
+import java.util.Iterator;
 
 public class VideoStreamerServer {
 
     public static void main(String[] args) {
-        // Path to your input video
-        String videoFile = "C:/Users/micha/Downloads/sample-5s.mp4";
-        // TCP port for client
+        String videoFile = "C:/Users/micha/Downloads/sample-5s.mp4"; // Adjust path
         int port = 9999;
 
-        //help
+        // Force these settings for smoother streaming:
+        final int targetWidth  = 640;
+        final int targetHeight = 360;
+        final double forcedFps = 30.0;      // 30 frames per second
+        final float jpegQuality = 0.3f;     // Lower quality => smaller frames => less lag
+
         try (ServerSocket serverSocket = new ServerSocket(port)) {
             System.out.println("Server listening on port " + port);
 
-            // Accept a single client
             Socket socket = serverSocket.accept();
             System.out.println("Client connected.");
 
-            // Create a grabber to read the local file
+            DataOutputStream outStream = new DataOutputStream(socket.getOutputStream());
+
+            // Initialize the grabber
             FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(videoFile);
+
+            // Set forced resolution
+            grabber.setImageWidth(targetWidth);
+            grabber.setImageHeight(targetHeight);
+
+            // Start grabbing
             grabber.start();
 
-            // Set up a FrameRecorder that encodes to H.264 in an MPEG-TS container
-            OutputStream socketOut = socket.getOutputStream();
-            FFmpegFrameRecorder recorder = new FFmpegFrameRecorder(
-                    socketOut,
-                    grabber.getImageWidth(),
-                    grabber.getImageHeight()
-            );
-            recorder.setFormat("mpegts"); // container
-            recorder.setVideoCodec(avcodec.AV_CODEC_ID_H264); // H.264
-            recorder.setAudioCodec(avcodec.AV_CODEC_ID_AAC);  // AAC
+            // Force a stable 30 FPS, ignoring original video frame rate
+            grabber.setFrameRate(forcedFps);
 
-            // Copy original audio info
-            recorder.setSampleRate(grabber.getSampleRate());
-            recorder.setAudioChannels(grabber.getAudioChannels());
-
-            // Set a video bitrate and fallback frame rate if none is provided
-            recorder.setVideoBitrate(1_000_000); // ~1 Mbps
-            double originalFps = grabber.getFrameRate();
-            if (originalFps <= 0) {
-                originalFps = 30; // fallback
-            }
-            recorder.setFrameRate(originalFps);
-
-            // Start the recorder
-            recorder.start();
-
-            // We'll track real time from now
-            long startTime = System.currentTimeMillis();
+            // We'll sleep ~33ms each frame
+            long frameIntervalMs = (long) (1000 / forcedFps);
+            long lastFrameTime = System.currentTimeMillis();
 
             Frame frame;
-            while ((frame = grabber.grab()) != null) {
-                // Use frame.timestamp to pace real-time
-                // timestamp is in microseconds (µs)
-                long ptsMs = frame.timestamp / 1000; // convert to ms
-                long elapsedMs = System.currentTimeMillis() - startTime;
-                long waitMs = ptsMs - elapsedMs;
-                if (waitMs > 0) {
-                    try {
-                        Thread.sleep(waitMs);
-                    } catch (InterruptedException ignored) {}
+            while ((frame = grabber.grabFrame()) != null) {
+                byte[] data;
+                int frameType;
+
+                if (frame.image != null) {
+                    // Video
+                    data = compressJPEG(frame, jpegQuality);
+                    frameType = 1;
+                } else if (frame.samples != null) {
+                    // Audio
+                    data = getAudioBytes(frame);
+                    frameType = 2;
+                } else {
+                    continue;
                 }
 
-                // Now record (encode) the frame
-                recorder.record(frame);
+                // Write frame type + data length + data
+                outStream.writeByte(frameType);
+                outStream.writeInt(data.length);
+                outStream.write(data);
+
+                // For video frames, sleep to maintain ~30 FPS
+                if (frameType == 1) {
+                    long now = System.currentTimeMillis();
+                    long elapsed = now - lastFrameTime;
+
+                    long sleepMs = frameIntervalMs - elapsed;
+                    if (sleepMs > 0) {
+                        try {
+                            Thread.sleep(sleepMs);
+                        } catch (InterruptedException ignored) {}
+                        lastFrameTime = System.currentTimeMillis(); // update after sleep
+                    } else {
+                        // If we're behind schedule, skip sleeping
+                        lastFrameTime = now;
+                    }
+                }
             }
 
             // Cleanup
-            recorder.stop();
-            recorder.release();
             grabber.stop();
-            socketOut.close();
+            outStream.close();
             socket.close();
-
-            System.out.println("Streaming finished. Server closed.");
+            System.out.println("Video stream finished.");
 
         } catch (Exception e) {
             e.printStackTrace();
+        }
+    }
+
+    /**
+     * Compress a video Frame to JPEG bytes with a custom quality.
+     */
+    private static byte[] compressJPEG(Frame frame, float quality) throws IOException {
+        // Convert the Frame to a BufferedImage
+        Java2DFrameConverter converter = new Java2DFrameConverter();
+        BufferedImage image = converter.convert(frame);
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+
+        // Find JPEG writer
+        Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpg");
+        if (!writers.hasNext()) {
+            throw new IOException("No JPEG writers found");
+        }
+        ImageWriter writer = writers.next();
+
+        // Configure JPEG compression
+        ImageWriteParam param = writer.getDefaultWriteParam();
+        param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+        param.setCompressionQuality(quality); // 0 = worst, 1 = best
+
+        try (MemoryCacheImageOutputStream mcios = new MemoryCacheImageOutputStream(baos)) {
+            writer.setOutput(mcios);
+            writer.write(null, new IIOImage(image, null, null), param);
+        } finally {
+            writer.dispose();
+        }
+
+        return baos.toByteArray();
+    }
+
+    /**
+     * Convert 16-bit PCM audio to little-endian bytes.
+     */
+    private static byte[] getAudioBytes(Frame frame) {
+        if (frame.samples == null || frame.samples.length == 0) {
+            return new byte[0];
+        }
+        try {
+            ShortBuffer sb = (ShortBuffer) frame.samples[0];
+            short[] shortArray = new short[sb.remaining()];
+            sb.get(shortArray);
+
+            ByteBuffer bb = ByteBuffer.allocate(shortArray.length * 2);
+            bb.order(ByteOrder.LITTLE_ENDIAN);
+            for (short s : shortArray) {
+                bb.putShort(s);
+            }
+            return bb.array();
+        } catch (Exception e) {
+            System.err.println("Audio conversion error: " + e.getMessage());
+            return new byte[0];
         }
     }
 }
