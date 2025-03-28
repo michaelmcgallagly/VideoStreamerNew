@@ -2,69 +2,142 @@ package main;
 
 import org.bytedeco.javacv.*;
 
+import javax.sound.sampled.*;
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
 import java.io.*;
 import java.net.Socket;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
 public class VideoStreamerClient {
 
+    // We'll use an empty byte array as a sentinel to signal video decoding thread to stop
+    private static final byte[] SENTINEL = new byte[0];
+
     public static void main(String[] args) {
-        String host = "10.12.31.180"; // or your server's IP
+        String host = "10.12.31.180"; // Adjust host/IP as needed
         int port = 9999;
 
-        // We'll store the incoming H.264 stream into a temporary file
-        File tempFile = new File("C:/temp/video_stream.ts");  // or use createTempFile
+        // A thread-safe queue to store incoming video frames (compressed JPEG)
+        BlockingQueue<byte[]> videoQueue = new LinkedBlockingQueue<>();
 
-        try (Socket socket = new Socket(host, port)) {
-            System.out.println("Connected to server. Receiving H.264 stream...");
+        try (Socket socket = new Socket(host, port);
+             DataInputStream inStream = new DataInputStream(socket.getInputStream())) {
 
-            // Thread that writes raw data from the socket into tempFile
-            Thread writerThread = new Thread(() -> {
-                try (InputStream in = socket.getInputStream();
-                     FileOutputStream fos = new FileOutputStream(tempFile)) {
+            System.out.println("Connected to server.");
 
-                    byte[] buffer = new byte[8192];
-                    int bytesRead;
-                    while ((bytesRead = in.read(buffer)) != -1) {
-                        fos.write(buffer, 0, bytesRead);
+            // Prepare the display window
+            CanvasFrame canvasFrame = new CanvasFrame("Video Streamer");
+            canvasFrame.setCanvasSize(640, 480);
+
+            // Setup audio: 44.1 kHz, 16-bit, stereo, little-endian
+            AudioFormat audioFormat = new AudioFormat(44100, 16, 2, true, false);
+
+            DataLine.Info info = new DataLine.Info(SourceDataLine.class, audioFormat);
+            SourceDataLine audioLine = (SourceDataLine) AudioSystem.getLine(info);
+            // Larger buffer helps avoid crackling but can increase audio latency
+            audioLine.open(audioFormat, 12288);
+            audioLine.start();
+
+            // -----------------------
+            // Thread 1: Socket Reader
+            // -----------------------
+            Thread readerThread = new Thread(() -> {
+                try {
+                    while (true) {
+                        // Read frame metadata
+                        int frameType;
+                        try {
+                            frameType = inStream.readByte(); // 1 = video, 2 = audio
+                        } catch (EOFException eof) {
+                            System.out.println("Stream ended (reader).");
+                            break;
+                        }
+
+                        int frameLength = inStream.readInt();
+                        byte[] frameBytes = inStream.readNBytes(frameLength);
+
+                        // Video -> store in queue
+                        if (frameType == 1) {
+                            videoQueue.offer(frameBytes);
+                        }
+                        // Audio -> write directly to audioLine
+                        else if (frameType == 2) {
+                            audioLine.write(frameBytes, 0, frameBytes.length);
+                        }
                     }
-                    System.out.println("Socket stream ended.");
                 } catch (IOException e) {
-                    System.err.println("Writer thread error: " + e.getMessage());
+                    System.err.println("Reader thread error: " + e.getMessage());
+                } finally {
+                    // Signal decode thread to stop by offering the sentinel
+                    videoQueue.offer(SENTINEL);
                 }
-            }, "WriterThread");
-            writerThread.start();
+            }, "ReaderThread");
+            readerThread.start();
 
-            // Meanwhile, let's open the tempFile with FFmpegFrameGrabber after a short delay
-            // so the file has some data in it. We'll keep reading as it grows.
-            Thread.sleep(2000); // Let some data accumulate
-
-            try (FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(tempFile)) {
-                grabber.start();
-
-                // Use JavaCV's built-in player or handle audio yourself
-                CanvasFrame canvas = new CanvasFrame("H.264 Stream", 1);
-                canvas.setDefaultCloseOperation(javax.swing.JFrame.EXIT_ON_CLOSE);
-
-                Frame frame;
-                while ((frame = grabber.grab()) != null) {
-                    // If you want to handle audio separately, you'd do so here.
-                    if (frame.image != null && canvas.isVisible()) {
-                        canvas.showImage(frame);
+            // -----------------------------
+            // Thread 2: Video Decode/Display
+            // -----------------------------
+            Thread decodeThread = new Thread(() -> {
+                try {
+                    while (true) {
+                        // Take compressed frame from queue
+                        byte[] compressedBytes = videoQueue.take();
+                        // If it's the sentinel, end decoding
+                        if (compressedBytes == SENTINEL) {
+                            System.out.println("Decode thread received sentinel; shutting down.");
+                            break;
+                        }
+                        // Decode the compressed JPEG bytes into a Frame
+                        Frame frame = convertBytesToFrame(compressedBytes);
+                        // Display if valid
+                        if (frame != null && canvasFrame.isVisible()) {
+                            canvasFrame.showImage(frame);
+                        }
                     }
+                } catch (InterruptedException e) {
+                    System.err.println("Decode thread interrupted: " + e.getMessage());
                 }
+            }, "DecodeThread");
+            decodeThread.start();
 
-                canvas.dispose();
-            }
+            // -----------------------------------
+            // Main thread waits until decode done
+            // -----------------------------------
+            decodeThread.join();
 
-            // Wait for the writer thread to finish
-            writerThread.join();
+            // Cleanup
+            canvasFrame.dispose();
+            audioLine.drain();
+            audioLine.close();
+
+            // Also wait for the reader thread to finish if needed
+            readerThread.join();
+
             System.out.println("Client finished.");
 
         } catch (Exception e) {
             e.printStackTrace();
-        } finally {
-            // Potentially delete the temp file or keep it
-            // tempFile.delete();
+        }
+    }
+
+    /**
+     * Convert compressed JPEG bytes to a JavaCV Frame for display.
+     */
+    private static Frame convertBytesToFrame(byte[] frameBytes) {
+        try {
+            // Decode JPEG to BufferedImage
+            BufferedImage image = ImageIO.read(new ByteArrayInputStream(frameBytes));
+            if (image == null) {
+                System.err.println("Error decoding image, skipping frame.");
+                return null;
+            }
+            // Convert to JavaCV Frame
+            return new Java2DFrameConverter().convert(image);
+        } catch (IOException e) {
+            System.err.println("Error converting video frame: " + e.getMessage());
+            return null;
         }
     }
 }
