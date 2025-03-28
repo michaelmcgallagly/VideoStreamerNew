@@ -19,14 +19,16 @@ import java.util.Iterator;
 public class VideoStreamerServer {
 
     public static void main(String[] args) {
-        String videoFile = "C:/Users/micha/Downloads/sample-5s.mp4"; // Adjust path
+        // Path to your video
+        String videoFile = "C:/Users/micha/Downloads/sample-5s.mp4";
+        // Server port
         int port = 9999;
 
-        // Force these settings for smoother streaming:
-        final int targetWidth  = 640;
-        final int targetHeight = 360;
-        final double forcedFps = 30.0;      // 30 frames per second
-        final float jpegQuality = 0.3f;     // Lower quality => smaller frames => less lag
+        // Aggressive settings for less lag:
+        final int targetWidth  = 320;   // smaller resolution
+        final int targetHeight = 180;
+        final double forcedFps = 15.0;  // lower FPS => fewer frames
+        final float jpegQuality = 0.2f; // more compression => smaller data
 
         try (ServerSocket serverSocket = new ServerSocket(port)) {
             System.out.println("Server listening on port " + port);
@@ -34,22 +36,23 @@ public class VideoStreamerServer {
             Socket socket = serverSocket.accept();
             System.out.println("Client connected.");
 
+            // Output stream to send frames
             DataOutputStream outStream = new DataOutputStream(socket.getOutputStream());
 
             // Initialize the grabber
             FFmpegFrameGrabber grabber = new FFmpegFrameGrabber(videoFile);
 
-            // Set forced resolution
+            // Force resolution
             grabber.setImageWidth(targetWidth);
             grabber.setImageHeight(targetHeight);
 
             // Start grabbing
             grabber.start();
 
-            // Force a stable 30 FPS, ignoring original video frame rate
+            // Force stable 15 FPS
             grabber.setFrameRate(forcedFps);
 
-            // We'll sleep ~33ms each frame
+            // We'll sleep ~66ms each frame
             long frameIntervalMs = (long) (1000 / forcedFps);
             long lastFrameTime = System.currentTimeMillis();
 
@@ -58,12 +61,11 @@ public class VideoStreamerServer {
                 byte[] data;
                 int frameType;
 
+                // Distinguish video vs. audio
                 if (frame.image != null) {
-                    // Video
                     data = compressJPEG(frame, jpegQuality);
                     frameType = 1;
                 } else if (frame.samples != null) {
-                    // Audio
                     data = getAudioBytes(frame);
                     frameType = 2;
                 } else {
@@ -75,7 +77,7 @@ public class VideoStreamerServer {
                 outStream.writeInt(data.length);
                 outStream.write(data);
 
-                // For video frames, sleep to maintain ~30 FPS
+                // For video frames, sleep to maintain ~15 FPS
                 if (frameType == 1) {
                     long now = System.currentTimeMillis();
                     long elapsed = now - lastFrameTime;
@@ -85,9 +87,9 @@ public class VideoStreamerServer {
                         try {
                             Thread.sleep(sleepMs);
                         } catch (InterruptedException ignored) {}
-                        lastFrameTime = System.currentTimeMillis(); // update after sleep
+                        lastFrameTime = System.currentTimeMillis();
                     } else {
-                        // If we're behind schedule, skip sleeping
+                        // If behind schedule, skip sleeping
                         lastFrameTime = now;
                     }
                 }
@@ -105,16 +107,15 @@ public class VideoStreamerServer {
     }
 
     /**
-     * Compress a video Frame to JPEG bytes with a custom quality.
+     * Compress a video Frame to JPEG bytes with custom quality.
      */
     private static byte[] compressJPEG(Frame frame, float quality) throws IOException {
-        // Convert the Frame to a BufferedImage
         Java2DFrameConverter converter = new Java2DFrameConverter();
         BufferedImage image = converter.convert(frame);
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
 
-        // Find JPEG writer
+        // Find a JPEG writer
         Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpg");
         if (!writers.hasNext()) {
             throw new IOException("No JPEG writers found");
@@ -124,7 +125,7 @@ public class VideoStreamerServer {
         // Configure JPEG compression
         ImageWriteParam param = writer.getDefaultWriteParam();
         param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
-        param.setCompressionQuality(quality); // 0 = worst, 1 = best
+        param.setCompressionQuality(quality); // 0 = min quality, 1 = max
 
         try (MemoryCacheImageOutputStream mcios = new MemoryCacheImageOutputStream(baos)) {
             writer.setOutput(mcios);
