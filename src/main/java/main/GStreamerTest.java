@@ -1,3 +1,5 @@
+package main;
+
 import org.bytedeco.javacv.CanvasFrame;
 import org.bytedeco.javacv.Frame;
 import org.bytedeco.javacv.FrameGrabber;
@@ -5,7 +7,8 @@ import org.bytedeco.javacv.OpenCVFrameGrabber;
 
 public class GStreamerTest {
     public static void main(String[] args) {
-        FrameGrabber grabber = new OpenCVFrameGrabber(0); // 0 for the default webcam
+        // 0 for the default webcam
+        FrameGrabber grabber = new OpenCVFrameGrabber(0);
         try {
             grabber.start();
             Frame frame;
