@@ -15,6 +15,7 @@ public class VideoStreamerServer {
         // TCP port for client
         int port = 9999;
 
+        //help
         try (ServerSocket serverSocket = new ServerSocket(port)) {
             System.out.println("Server listening on port " + port);
 
