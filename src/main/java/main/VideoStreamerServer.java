@@ -27,31 +27,48 @@ public class VideoStreamerServer {
             grabber.start();
 
             // Set up a FrameRecorder that encodes to H.264 in an MPEG-TS container
-            // We'll send the encoded stream directly to the socket output
             OutputStream socketOut = socket.getOutputStream();
+            FFmpegFrameRecorder recorder = new FFmpegFrameRecorder(
+                    socketOut,
+                    grabber.getImageWidth(),
+                    grabber.getImageHeight()
+            );
+            recorder.setFormat("mpegts"); // container
+            recorder.setVideoCodec(avcodec.AV_CODEC_ID_H264); // H.264
+            recorder.setAudioCodec(avcodec.AV_CODEC_ID_AAC);  // AAC
 
-            // We can pick "mpegts", "flv", or another container that supports H.264
-            // Some recommended: "mpegts" (MPEG-TS), "flv", or "matroska".
-            FFmpegFrameRecorder recorder = new FFmpegFrameRecorder(socketOut, grabber.getImageWidth(), grabber.getImageHeight());
-            recorder.setFormat("mpegts");         // container
-            recorder.setVideoCodec(avcodec.AV_CODEC_ID_H264);  // H.264
-            recorder.setAudioCodec(avcodec.AV_CODEC_ID_AAC);   // or AV_CODEC_ID_MP2, etc.
-
-            // Copy original sample rate/channels from the grabber if needed
+            // Copy original audio info
             recorder.setSampleRate(grabber.getSampleRate());
             recorder.setAudioChannels(grabber.getAudioChannels());
 
-            // Optionally tune the bitrate or preset for H.264
-            recorder.setVideoBitrate(1000_000);   // e.g. 1 Mbps
-            recorder.setFrameRate(grabber.getFrameRate() > 0 ? grabber.getFrameRate() : 30);
+            // Set a video bitrate and fallback frame rate if none is provided
+            recorder.setVideoBitrate(1_000_000); // ~1 Mbps
+            double originalFps = grabber.getFrameRate();
+            if (originalFps <= 0) {
+                originalFps = 30; // fallback
+            }
+            recorder.setFrameRate(originalFps);
 
             // Start the recorder
             recorder.start();
 
-            // Now read frames from grabber, encode them with the recorder
+            // We'll track real time from now
+            long startTime = System.currentTimeMillis();
+
             Frame frame;
             while ((frame = grabber.grab()) != null) {
-                // This includes both audio and video frames
+                // Use frame.timestamp to pace real-time
+                // timestamp is in microseconds (µs)
+                long ptsMs = frame.timestamp / 1000; // convert to ms
+                long elapsedMs = System.currentTimeMillis() - startTime;
+                long waitMs = ptsMs - elapsedMs;
+                if (waitMs > 0) {
+                    try {
+                        Thread.sleep(waitMs);
+                    } catch (InterruptedException ignored) {}
+                }
+
+                // Now record (encode) the frame
                 recorder.record(frame);
             }
 

@@ -8,7 +8,7 @@ import java.net.Socket;
 public class VideoStreamerClient {
 
     public static void main(String[] args) {
-        String host = "localhost"; // or your server's IP
+        String host = "10.12.31.180"; // or your server's IP
         int port = 9999;
 
         // We'll store the incoming H.264 stream into a temporary file
